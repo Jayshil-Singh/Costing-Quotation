@@ -74,3 +74,28 @@ The quotation preview is rendered page-by-page with PyMuPDF and displayed as ima
 - Corrected the Windows launcher version marker. Existing installations that previously skipped dependency installation will now install/check the current `requirements.txt` on the next launch.
 - The requirements include `PyMuPDF`, which provides the `fitz` module used to render PDF pages as preview images.
 - If the preview still reports a missing `fitz` module, close Streamlit, run `start_app.bat` again, and check that the package installation completes without errors. The app will continue to provide the PDF download even if preview rendering is unavailable.
+
+## Persistent Supabase PostgreSQL storage
+
+The app uses Supabase PostgreSQL when `SUPABASE_DB_URL` is present in Streamlit Secrets. If that secret is absent, local development continues to use `data/costing_quotes.db` (SQLite).
+
+### Streamlit Cloud
+
+In **App → Settings → Secrets**, configure:
+
+```toml
+SUPABASE_DB_URL = "postgresql://postgres:YOUR_PASSWORD@YOUR_HOST:5432/postgres"
+```
+
+Use the connection URI from the Supabase dashboard. Prefer the Session Pooler URI if a direct connection is not reachable from your environment. Keep this secret out of GitHub.
+
+### One-time SQLite migration
+
+1. Make a backup copy of `data/costing_quotes.db` before doing anything else.
+2. On a computer with Python installed, install the packages in `requirements.txt`.
+3. Set `SUPABASE_DB_URL` in your local shell to the same database URI stored in Streamlit Secrets. Do not put the URI in source code.
+4. Run `python migrate_sqlite_to_supabase.py` from this folder.
+5. Confirm the printed counts against the source database and check the Supabase Table Editor before relying on the app.
+6. Commit and push the code changes to GitHub, then wait for Streamlit Cloud to redeploy.
+
+The migration script refuses to run if the target Supabase database already contains quotations. It imports settings, catalogue items, DatecPay tiers, price history and saved quotations. It does not delete the local SQLite backup.

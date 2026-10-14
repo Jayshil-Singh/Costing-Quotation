@@ -4,6 +4,14 @@ import json
 import math
 import os
 import sqlite3
+from contextlib import contextmanager
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # PostgreSQL support is installed in Streamlit Cloud via requirements.txt
+    psycopg = None
+    dict_row = None
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -133,12 +141,89 @@ def _number(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class _PostgresConnection:
+    """Small SQLite-compatible adapter so existing costing queries can use PostgreSQL."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    @staticmethod
+    def _sql(sql: str) -> str:
+        # All existing application SQL uses qmark parameters, not literal question marks.
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=()):
+        sql = sql.strip()
+        if sql.upper().startswith("PRAGMA "):
+            # Schema introspection is handled with portable ALTER TABLE statements below.
+            return _EmptyCursor()
+        return self._conn.execute(self._sql(sql), params)
+
+    def executemany(self, sql, seq):
+        # psycopg 3 exposes executemany on cursors, not on Connection.
+        with self._conn.cursor() as cursor:
+            return cursor.executemany(self._sql(sql), seq)
+
+    def executescript(self, script):
+        # Schema statements in init_db are simple CREATE TABLE statements.
+        for statement in script.split(';'):
+            statement = statement.strip()
+            if statement:
+                statement = statement.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+                self._conn.execute(statement)
+
+    def commit(self):
+        self._conn.commit()
+
+
+class _EmptyCursor:
+    def fetchall(self):
+        return []
+    def fetchone(self):
+        return None
+
+
+def _supabase_db_url() -> str:
+    """Read the connection URL from Streamlit Secrets first, then environment."""
+    value = os.environ.get("SUPABASE_DB_URL", "").strip()
+    if value:
+        return value
+    try:
+        import streamlit as st
+        return str(st.secrets.get("SUPABASE_DB_URL", "") or "").strip()
+    except Exception:
+        return ""
+
+
+@contextmanager
+def connect():
+    db_url = _supabase_db_url()
+    if not db_url:
+        # Local development continues to use the existing SQLite database.
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return
+    if psycopg is None:
+        raise RuntimeError("PostgreSQL driver missing. Add psycopg[binary] to requirements.txt and redeploy.")
+    # Supabase connection strings commonly start with postgresql:// or postgres://.
+    with psycopg.connect(db_url, row_factory=dict_row, connect_timeout=15) as raw:
+        yield _PostgresConnection(raw)
 
 
 def _migrate_v1_1_unit_price_catalog(conn: sqlite3.Connection) -> None:
@@ -371,7 +456,7 @@ def _migrate_epicor_dynamic_cost_defaults_v1_6(conn: sqlite3.Connection) -> None
     row = conn.execute(
         "SELECT id, item_name, buy_price, list_price, default_qty FROM catalog_items "
         "WHERE product='Epicor' AND variant='Kinetic Upgrade' "
-        "AND lower(item_name) LIKE '%technical unit cost%' LIMIT 1"
+        "AND lower(item_name) LIKE '%%technical unit cost%%' LIMIT 1"
     ).fetchone()
     if row:
         if float(row["buy_price"] or 0) != 0 or float(row["list_price"] or 0) != 0:
@@ -389,7 +474,7 @@ def _migrate_epicor_dynamic_cost_defaults_v1_6(conn: sqlite3.Connection) -> None
     # Do not store a prior project-specific price in the optional service cost line either.
     conn.execute(
         "UPDATE catalog_items SET buy_price=0, list_price=0, updated_at=? "
-        "WHERE product='Epicor' AND variant='Kinetic Upgrade' AND item_name LIKE 'Project Management / UAT / Go-Live Services%'",
+        "WHERE product='Epicor' AND variant='Kinetic Upgrade' AND item_name LIKE 'Project Management / UAT / Go-Live Services%%'",
         (now,),
     )
     conn.execute("INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -460,12 +545,17 @@ def init_db() -> None:
             loss_reason TEXT NOT NULL DEFAULT ''
         );
         """)
-        quote_columns = {r[1] for r in conn.execute("PRAGMA table_info(quotes)").fetchall()}
-        if "loss_reason" not in quote_columns:
-            conn.execute("ALTER TABLE quotes ADD COLUMN loss_reason TEXT NOT NULL DEFAULT ''")
-        catalog_columns = {r[1] for r in conn.execute("PRAGMA table_info(catalog_items)").fetchall()}
-        if "list_price" not in catalog_columns:
-            conn.execute("ALTER TABLE catalog_items ADD COLUMN list_price REAL NOT NULL DEFAULT 0")
+        # Portable schema upgrades for SQLite and PostgreSQL.
+        if _supabase_db_url():
+            conn.execute("ALTER TABLE quotes ADD COLUMN IF NOT EXISTS loss_reason TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS list_price DOUBLE PRECISION NOT NULL DEFAULT 0")
+        else:
+            quote_columns = {r[1] for r in conn.execute("PRAGMA table_info(quotes)").fetchall()}
+            if "loss_reason" not in quote_columns:
+                conn.execute("ALTER TABLE quotes ADD COLUMN loss_reason TEXT NOT NULL DEFAULT ''")
+            catalog_columns = {r[1] for r in conn.execute("PRAGMA table_info(catalog_items)").fetchall()}
+            if "list_price" not in catalog_columns:
+                conn.execute("ALTER TABLE catalog_items ADD COLUMN list_price REAL NOT NULL DEFAULT 0")
         existing_settings = {r["key"] for r in conn.execute("SELECT key FROM settings")}
         for key, value in DEFAULT_SETTINGS.items():
             if key not in existing_settings:
